@@ -41,6 +41,13 @@ def get_args():
 
     return parser.parse_args()
 
+def iterate_bboxes(image_width, image_height, tile_size):
+    for y in range(0, image_height, tile_size):
+        for x in range(0, image_width, tile_size):
+            # Define bounding box coordinates
+            bbox = (x, y, min(x + tile_size, image_width), min(y + tile_size, image_height))
+            yield bbox
+
 def main(args):
     SCENE_IDX=1
     CH_IDX=1
@@ -64,9 +71,8 @@ def main(args):
     print("Rescaling image intensity...")
     frame_rescaled = exposure.rescale_intensity(img_dask, in_range=(pl, pu),out_range=(0,1))
 
-    pred = unet_predictions(frame_rescaled[np.newaxis,:,:],"lightsheet_2D_unet_root_ds1x",patch=[1,1024,1024])
+    pred = unet_predictions(frame_rescaled[np.newaxis,:,:],"lightsheet_2D_unet_root_ds1x",patch=[1,2048,2048])
 
-    res = []
     param_grid = {
         "beta": [ round(x,1) for x in np.arange(0.3,1.05,0.1)],
         "post_minsize": [ round(x,1) for x in np.arange(90,110,10)],
@@ -78,7 +84,14 @@ def main(args):
         beta = param["beta"]
         post_mini_size = param["post_minsize"]
 
-        mask = mutex_ws(pred,superpixels=None,beta=beta,post_minsize=post_mini_size,n_threads=6)
+        mask = np.zeros_like(pred)
+        image_width, image_height = pred.shape[1], pred.shape[2]
+        tile_size = 4096
+        
+        # limited ram
+        for bbox in tqdm(iterate_bboxes(image_width, image_height, tile_size), desc="Processing tiled watershed"):
+            x0, y0, x1, y1 = bbox
+            mask[x0:x1,y0:y1] = mutex_ws(pred[x0:x1,y0:y1],superpixels=None,beta=beta,post_minsize=post_mini_size,n_threads=6)
         mask_relab, fw, inv = relabel_sequential(mask[0,:,:])
         outlines = utils.masks_to_outlines(mask_relab)
 
@@ -87,32 +100,13 @@ def main(args):
         imgout= img0.copy()
         imgout[outX, outY] = np.array([255,0,0]) # pure red
 
-        # perform region properties measurements
-        props = regionprops(mask_relab)
-        props_table = regionprops_table(mask_relab,properties=["centroid","area","area_convex","area_filled","axis_major_length","axis_minor_length","eccentricity","feret_diameter_max","perimeter","perimeter_crofton","solidity"])
-        props_df = pd.DataFrame.from_dict(props_table)
-
-        res.append({
-            "beta": beta,
-            "post_mini_size": post_mini_size,
-            "img": img_dask,
-            "pred": pred[0,:,:],
-            "mask": mask_relab,
-            "overlay": imgout,
-            "props": props,
-            "props_df": props_df
-        })
-
-    # save report
-    os.makedirs(args.output,exist_ok=True)
-    for res_ in tqdm(res,desc="Result saving"):
-        out_dir_ = os.path.join(args.output,"beta-{}_pms-{}".format(res_["beta"], res_["post_mini_size"]))
+        # save report
+        out_dir_ = os.path.join(args.output,"beta-{}_pms-{}".format(beta, post_mini_size))
         os.makedirs(out_dir_,exist_ok=True)
-        OmeTiffWriter.save(res_["img"],os.path.join(out_dir_,"img.ome.tif"),dim_order="YX")
-        OmeTiffWriter.save(res_["pred"],os.path.join(out_dir_,"pred.ome.tif"),dim_order="YX")
-        OmeTiffWriter.save(res_["mask"],os.path.join(out_dir_,"mask.ome.tif"),dim_order="YX")
-        OmeTiffWriter.save(res_["overlay"],os.path.join(out_dir_,"overlay.ome.tif"),dim_order="YXS")
-        res_["props_df"].to_csv(os.path.join(out_dir_,"props.csv"),index=False)
+        OmeTiffWriter.save(img_dask,os.path.join(out_dir_,"img.ome.tif"),dim_order="YX")
+        OmeTiffWriter.save(pred[0,:,:],os.path.join(out_dir_,"pred.ome.tif"),dim_order="YX")
+        OmeTiffWriter.save(mask_relab,os.path.join(out_dir_,"mask.ome.tif"),dim_order="YX")
+        OmeTiffWriter.save(imgout,os.path.join(out_dir_,"overlay.ome.tif"),dim_order="YXS")
 
 if __name__ == "__main__":
     args = get_args()
