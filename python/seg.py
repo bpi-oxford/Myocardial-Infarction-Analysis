@@ -16,6 +16,7 @@ import pyvips
 import tifffile
 from ome_types.model import OME, Image, Pixels, Channel
 from scipy import stats
+import multiprocessing
 
 def pyramidal_ome_tiff_write(image, path, resX=1.0, resY=1.0, units="µm", tile_size=2048, channel_colors=None):
     """
@@ -119,9 +120,9 @@ def get_args():
 
     return parser.parse_args()
 
-def iterate_bboxes(image_width, image_height, tile_size):
-    for y in range(0, image_height, tile_size):
-        for x in range(0, image_width, tile_size):
+def iterate_bboxes(image_width, image_height, tile_size, overlap):
+    for y in range(0, image_height, int(tile_size*(1-overlap))):
+        for x in range(0, image_width, int(tile_size*(1-overlap))):
             # Define bounding box coordinates
             bbox = (x, y, min(x + tile_size, image_width), min(y + tile_size, image_height))
             yield bbox
@@ -129,9 +130,9 @@ def iterate_bboxes(image_width, image_height, tile_size):
 def main(args):
     SCENE_IDX=1
     CH_IDX=1
-    SUBSAMPLE=10
+    SUBSAMPLE=4
     TAIL=1
-    SKIP_SEG=False
+    SKIP_SEG=True
     BACKGROUND = 1200
 
     img = AICSImage(args.input)
@@ -170,49 +171,88 @@ def main(args):
         # save report
         print("Saving segmentation labels...")
         os.makedirs(args.output,exist_ok=True)
-        # pyramidal_ome_tiff_write(frame_rescaled.T[:,:,np.newaxis], os.path.join(args.output,"img.ome.tif"), resX=img.physical_pixel_sizes.X, resY=img.physical_pixel_sizes.Y)
+        frame_rescaled_ = frame_rescaled.T[:,:,np.newaxis]*(2**16-1)
+        pyramidal_ome_tiff_write(frame_rescaled_.astype(np.uint16), os.path.join(args.output,"img.ome.tif"), resX=img.physical_pixel_sizes.X, resY=img.physical_pixel_sizes.Y)
         pyramidal_ome_tiff_write(pred_masked.T[:,:,np.newaxis].astype(np.float32), os.path.join(args.output,"pred.ome.tif"), resX=img.physical_pixel_sizes.X, resY=img.physical_pixel_sizes.Y)
     
     if SKIP_SEG:
         print("Skipping segmentation, load label directly")
         pred = tifffile.imread(os.path.join(args.output,"pred.ome.tif")).T[np.newaxis,:,:]
 
-    # param_grid = {
-    #     "beta": [ round(x,1) for x in np.arange(0.3,1.05,0.1)],
-    #     "post_minsize": [ round(x,1) for x in np.arange(90,110,10)],
-    # }
+    param_grid = {
+        "beta": [ round(x,1) for x in np.arange(0.6,1.05,0.1)],
+        "post_minsize": [ round(x,1) for x in np.arange(90,110,10)],
+    }
 
-    # params = list(ParameterGrid(param_grid))
+    params = list(ParameterGrid(param_grid))
 
-    # image_width, image_height = img_dask.shape[1], img_dask.shape[2]
-    # tile_size = 4096
+    image_width, image_height = img_dask.shape[1], img_dask.shape[2]
+    tile_size = 1024
+    overlap=0.0
     
-    # bboxes = iterate_bboxes(image_width, image_height, tile_size)
-    # bboxes = [bbox for bbox in bboxes]
+    bboxes = iterate_bboxes(image_width, image_height, tile_size, overlap)
+    bboxes = [bbox for bbox in bboxes][:]
 
-    # for param in tqdm(params, desc="Post processing"):
-    #     beta = param["beta"]
-    #     post_mini_size = param["post_minsize"]
+    for param in tqdm(params, desc="Post processing"):
+        beta = param["beta"]
+        post_minsize = param["post_minsize"]
 
-    #     # limited ram
-    #     mask = np.zeros_like(pred[0,:,:])
-    #     for bbox in tqdm(bboxes,total=len(bboxes), desc="Processing tiled watershed"):
-    #         x0, y0, x1, y1 = bbox
-    #         pred_ = pred[0,x0:x1,y0:y1]
-    #         mask[x0:x1,y0:y1] = mutex_ws(pred_,superpixels=None,beta=beta,post_minsize=post_mini_size,n_threads=6)
-    #     mask_relab, fw, inv = relabel_sequential(mask[0,:,:])
-    #     outlines = utils.masks_to_outlines(mask_relab)
+        # limited ram
+        mask = np.zeros_like(pred[0,:,:],dtype=np.uint16)
+        
+        pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
 
-    #     outX, outY = np.nonzero(outlines)
-    #     img0 = image_to_rgb(frame_rescaled, channels=[0,0])
-    #     imgout= img0.copy()
-    #     imgout[outX, outY] = np.array([255,0,0]) # pure red
+        # TODO: parallel processing
+        results = []
+        
+        data_to_process = []
 
-    #     # save watershed results
-    #     out_dir_ = os.path.join(args.output,"beta-{}_pms-{}".format(beta, post_mini_size))
-    #     os.makedirs(out_dir_,exist_ok=True)
-    #     OmeTiffWriter.save(mask_relab,os.path.join(out_dir_,"mask.ome.tif"),dim_order="YX")
-    #     OmeTiffWriter.save(imgout,os.path.join(out_dir_,"overlay.ome.tif"),dim_order="YXS")
+        with tqdm(total=len(bboxes),desc="Preparing watershed tiles") as pbar1:
+            for bbox in bboxes:
+                x0, y0, x1, y1 = bbox
+                pred_ = np.copy(pred[0,x0:x1,y0:y1])
+                if np.sum(pred_) < 0.001:
+                    pbar1.update(1)
+                    continue
+                data_to_process.append({"bbox":bbox,"pred":pred_})
+                pbar1.update(1)
+
+        with tqdm(total=len(bboxes), desc="Processing tiled watershed") as pbar:
+            def progress_update(res):
+                pbar.update(1)
+            
+            def error_callback(err):
+                print(err)
+
+            for data in data_to_process:
+                pred_ = data["pred"]
+                res = pool.apply_async(mutex_ws, (pred_,), {"superpixels": None, "beta": beta, "post_minsize": post_minsize, "n_threads": 6},callback=progress_update,error_callback=error_callback)
+                results.append({"res":res, "bbox": data["bbox"]})
+                # mask[x0:x1,y0:y1] = mutex_ws(pred_,superpixels=None,beta=beta,post_minsize=post_mini_size,n_threads=6)
+
+            for res in results:
+                x0, y0, x1, y1 = res["bbox"]
+                mask[x0:x1,y0:y1] = res["res"].get().astype(np.uint16)
+
+            pool.close()
+            pool.join()
+
+        mask_relab, fw, inv = relabel_sequential(mask)
+        # outlines = utils.masks_to_outlines(mask_relab)
+
+        # outX, outY = np.nonzero(outlines)
+        # img0 = image_to_rgb(frame_rescaled, channels=[0,0])
+        # imgout= img0.copy()
+        # imgout[outX, outY] = np.array([255,0,0]) # pure red
+
+        # save watershed results
+        out_dir_ = os.path.join(args.output,"beta-{}_pms-{}".format(beta, post_minsize))
+        os.makedirs(out_dir_,exist_ok=True)
+        # OmeTiffWriter.save(mask_relab,os.path.join(out_dir_,"mask.ome.tif"),dim_order="YX")
+        # OmeTiffWriter.save(imgout,os.path.join(out_dir_,"overlay.ome.tif"),dim_order="YXS")
+
+        pyramidal_ome_tiff_write(mask_relab.astype(np.uint16).T[:,:,np.newaxis], os.path.join(out_dir_,"mask_relab.ome.tif"), resX=img.physical_pixel_sizes.X, resY=img.physical_pixel_sizes.Y)
+        # pyramidal_ome_tiff_write(pred_masked.T[:,:,np.newaxis].astype(np.float32), os.path.join(args.output,"overlay.ome.tif"), resX=img.physical_pixel_sizes.X, resY=img.physical_pixel_sizes.Y)
 
 if __name__ == "__main__":
     args = get_args()
